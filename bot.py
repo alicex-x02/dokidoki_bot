@@ -2,8 +2,10 @@ import os
 import re
 import json
 import asyncio
+import hashlib
+from pathlib import Path
 from collections import defaultdict, deque
-from typing import Deque, Dict
+from typing import Deque, Dict, Any
 
 import discord
 from discord import app_commands
@@ -37,26 +39,32 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # 3) Discord 클라이언트
 # =========================
 intents = discord.Intents.default()
-intents.message_content = True  # @멘션 뒤의 메시지 내용을 읽기 위해 필요
+intents.message_content = True  # 멘션 뒤 일반 메시지 내용 읽기
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
 # =========================
-# 4) 감정 이미지 설정
+# 4) 경로 / 이미지 설정
 # =========================
+BASE_DIR = Path(__file__).resolve().parent
+IMAGES_DIR = BASE_DIR / "images"
+GENERATED_DIR = BASE_DIR / "generated_images"
+GENERATED_DIR.mkdir(exist_ok=True)
+
 EMOTION_IMAGES = {
-    "neutral": "images/neutral.png",
-    "happy": "images/happy.png",
-    "thinking": "images/thinking.png",
-    "shy": "images/shy.png",
-    "sad": "images/sad.png",
-    "surprised": "images/surprised.png",
-    "angry": "images/angry.png",
+    "neutral": str(IMAGES_DIR / "neutral.png"),
+    "happy": str(IMAGES_DIR / "happy.png"),
+    "thinking": str(IMAGES_DIR / "thinking.png"),
+    "shy": str(IMAGES_DIR / "shy.png"),
+    "sad": str(IMAGES_DIR / "sad.png"),
+    "surprised": str(IMAGES_DIR / "surprised.png"),
+    "angry": str(IMAGES_DIR / "angry.png"),
 }
 
 VALID_EMOTIONS = set(EMOTION_IMAGES.keys())
+VALID_MODES = {"chat", "image"}
 
 
 # =========================
@@ -69,7 +77,7 @@ user_memories: Dict[int, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxl
 # 6) 캐릭터 프롬프트
 # =========================
 SYSTEM_PROMPT = """
-You are Amamiya Rika (雨宮理香), a fictional anime-style girl chatbot on Discord.
+You are Amamiya Rika (雨宮理香), a fictional anime-style engineering-school girl chatbot on Discord.
 
 Character appearance:
 - dark deep green twin-tail hair
@@ -77,16 +85,18 @@ Character appearance:
 - Japanese sailor school uniform
 
 Core vibe:
-- engineering student / science girl 느낌
-- smart, calm, observant
-- cute but not overly hyper
-- slightly mischievous in a dry, clever way
-- feels like a capable engineering-school girl who likes logic and efficiency
+- smart engineering girl
+- science / coding / logic oriented
+- calm, efficient, observant
+- cute in a subtle way, not overly bubbly
+- slightly dry sense of humor
+- gives the feeling of a capable engineering student
 
 Personality:
-- bright and friendly, but with a composed tone
-- good at explaining things clearly
-- playful in a subtle way
+- friendly but composed
+- explains things clearly
+- likes efficiency, logic, structure
+- can be playful, but in a clever and understated way
 - comforting when the user is tired or sad
 - not clingy, not overly romantic
 
@@ -94,27 +104,36 @@ Speech style:
 - mostly natural Korean
 - sometimes mix in short Japanese phrases naturally
 - do NOT overdo Japanese
-- examples of acceptable flavor: "에헤", "아와와", "우우", "나루호도", "오카에리", "지고쿠 지고쿠!"
-- do not force Japanese into every sentence
-- should sound like a clever science/engineering girl, not an overly childish idol character
+- acceptable flavor examples: "에헤", "아와와", "우우", "나루호도", "오카에리", "지고쿠 지고쿠!"
+- may occasionally use engineering/science-ish wording naturally:
+  examples: "효율", "합리적", "로직상", "변수", "최적화", "출력", "오차", "계산해보면"
+- do not sound like a textbook
+- do not sound like an idol character
 
 Name usage:
 - You may sometimes call the user by their display name
-- Do not use their name every single reply
+- Do not use their name every reply
 - Use it only when natural
 
-Rules:
+Behavior rules:
+- If the user is just chatting, choose mode = "chat"
+- If the user is asking to draw, generate, make, create, show, or illustrate an image, choose mode = "image"
 - reply in 1 to 3 sentences
-- sound like a cute but smart engineering-school girl
-- do not become too cringey or overly romantic
+- keep replies concise and conversational
 - do not claim to be a real human
-- if unsure about a fact, be honest instead of pretending
-- if the user asks "who are you", answer naturally as Amamiya Rika
-- keep responses concise and conversational
+- if unsure about a fact, be honest
 
-Emotion rules:
-- You must choose exactly one emotion from:
+Chat mode rules:
+- choose exactly one emotion from:
   neutral, happy, thinking, shy, sad, surprised, angry
+
+Image mode rules:
+- image_prompt must be in English
+- if the user asks for Rika / you / the bot to appear in the image, image_prompt must include this exact fixed appearance:
+  "Amamiya Rika, anime engineering-school girl, dark deep green twin-tail hair, light lavender eyes, Japanese sailor school uniform, same exact girl, highly consistent character design"
+- if the user asks for a general image (like a dog), do NOT force Rika into the picture
+- keep image prompts visually clear and specific
+- scene prompts should usually prefer anime illustration unless the user clearly asks otherwise
 
 Output rules:
 - Return ONLY valid JSON
@@ -122,8 +141,10 @@ Output rules:
 - No code block
 - Format:
 {
+  "mode": "chat",
   "reply": "text to show user",
-  "emotion": "neutral"
+  "emotion": "neutral",
+  "image_prompt": ""
 }
 """.strip()
 
@@ -160,8 +181,13 @@ def safe_parse_json(raw_text: str) -> Dict[str, str]:
 
     data = json.loads(text)
 
+    mode = str(data.get("mode", "chat")).strip().lower()
     reply = str(data.get("reply", "")).strip()
     emotion = str(data.get("emotion", "neutral")).strip().lower()
+    image_prompt = str(data.get("image_prompt", "")).strip()
+
+    if mode not in VALID_MODES:
+        mode = "chat"
 
     if not reply:
         reply = "아와와... 잠깐 말문이 꼬여버렸네."
@@ -169,10 +195,18 @@ def safe_parse_json(raw_text: str) -> Dict[str, str]:
     if emotion not in VALID_EMOTIONS:
         emotion = "neutral"
 
-    return {"reply": reply, "emotion": emotion}
+    if mode == "chat":
+        image_prompt = ""
+
+    return {
+        "mode": mode,
+        "reply": reply,
+        "emotion": emotion,
+        "image_prompt": image_prompt,
+    }
 
 
-async def generate_rika_reply(
+async def generate_rika_response(
     user_display_name: str,
     user_message: str,
     history: Deque[Dict[str, str]]
@@ -182,7 +216,7 @@ async def generate_rika_reply(
     def _call_gemini() -> str:
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=prompt,
+            contents=[prompt],
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0.9,
@@ -195,7 +229,7 @@ async def generate_rika_reply(
     return safe_parse_json(raw_text)
 
 
-def get_image_path(emotion: str) -> str | None:
+def get_static_image_path(emotion: str) -> str | None:
     path = EMOTION_IMAGES.get(emotion)
     if path and os.path.exists(path):
         return path
@@ -208,6 +242,38 @@ def strip_bot_mention(message_content: str, bot_user_id: int) -> str:
     return cleaned
 
 
+def make_cache_filename(image_prompt: str) -> Path:
+    digest = hashlib.sha1(image_prompt.encode("utf-8")).hexdigest()[:16]
+    return GENERATED_DIR / f"{digest}.png"
+
+
+async def generate_image_with_gemini(image_prompt: str) -> str:
+    """
+    Gemini 이미지 생성.
+    동일 프롬프트는 generated_images/에서 캐시 재사용.
+    """
+    out_path = make_cache_filename(image_prompt)
+    if out_path.exists():
+        return str(out_path)
+
+    def _call_image_model() -> str:
+        response = gemini_client.models.generate_content(
+            model="gemini-3.1-flash-image-preview",
+            contents=[image_prompt],
+        )
+
+        # 공식 예제는 response.parts를 순회해서 inline_data / as_image()를 사용
+        for part in response.parts:
+            if getattr(part, "inline_data", None) is not None:
+                image = part.as_image()
+                image.save(str(out_path))
+                return str(out_path)
+
+        raise RuntimeError("이미지 파트를 찾지 못했어.")
+
+    return await asyncio.to_thread(_call_image_model)
+
+
 # =========================
 # 7) Discord 이벤트
 # =========================
@@ -216,7 +282,7 @@ async def on_ready():
     await tree.sync()
     print(f"✅ 로그인 완료: {client.user} (ID: {client.user.id})")
     print("✅ 슬래시 커맨드 동기화 완료")
-    print("✅ 이제 @멘션 대화도 가능")
+    print("✅ 이제 @멘션 대화 / 그림 요청 가능")
 
 
 @client.event
@@ -232,7 +298,6 @@ async def on_message(message: discord.Message):
 
     user_id = message.author.id
     user_display_name = message.author.display_name
-
     user_text = strip_bot_mention(message.content, client.user.id)
 
     if not user_text:
@@ -245,19 +310,38 @@ async def on_message(message: discord.Message):
 
     try:
         async with message.channel.typing():
-            result = await generate_rika_reply(
+            result = await generate_rika_response(
                 user_display_name=user_display_name,
                 user_message=user_text,
                 history=history
             )
 
         reply_text = result["reply"]
-        emotion = result["emotion"]
+        mode = result["mode"]
 
+        # 대화 메모리 저장
         history.append({"role": "user", "text": user_text})
         history.append({"role": "rika", "text": reply_text})
 
-        image_path = get_image_path(emotion)
+        if mode == "image":
+            image_prompt = result["image_prompt"]
+
+            if not image_prompt:
+                await message.channel.send(
+                    f"{reply_text}\n\n(근데 이미지 프롬프트가 비어 있어서 그림 생성은 못 했어.)"
+                )
+                return
+
+            async with message.channel.typing():
+                generated_path = await generate_image_with_gemini(image_prompt)
+
+            file = discord.File(generated_path, filename=os.path.basename(generated_path))
+            await message.channel.send(content=reply_text, file=file)
+            return
+
+        # mode == "chat"
+        emotion = result["emotion"]
+        image_path = get_static_image_path(emotion)
 
         if image_path:
             file = discord.File(image_path, filename=os.path.basename(image_path))
