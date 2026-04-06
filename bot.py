@@ -5,13 +5,14 @@ import asyncio
 import hashlib
 from pathlib import Path
 from collections import defaultdict, deque
-from typing import Deque, Dict, List, Any
+from typing import Deque, Dict, List, Tuple
 
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
 from openai import OpenAI
 from google import genai
+from duckduckgo_search import DDGS
 
 
 # =========================
@@ -156,24 +157,34 @@ Return ONLY valid JSON.
 }
 """.strip()
 
-IMAGE_PROMPT_SYSTEM = """
-You generate JSON for image requests.
+IMAGE_REQUEST_SYSTEM = """
+You analyze an image-related user request and return ONLY valid JSON.
 
-Output:
-Return ONLY valid JSON.
+Output format:
 {
-  "reply": "short Korean reply to the user",
-  "image_prompt": "English image prompt only"
+  "mode": "generate" or "search",
+  "reply": "short Korean reply as Amamiya Rika",
+  "image_prompt": "English image prompt only, or empty string",
+  "search_query": "web image search query, or empty string"
 }
 
 Rules:
-- reply should be short and natural in Korean, as Amamiya Rika
-- image_prompt must be in English
-- if the user wants Rika / the bot / "you" in the image, include this exact base appearance:
+- mode=generate:
+  - for requests like drawing, creating, generating, making an illustration, making a new image
+  - fill image_prompt
+  - search_query may be empty
+- mode=search:
+  - for requests like show me an image/photo/picture from the web, find an image, search an image online
+  - fill search_query
+  - image_prompt should be empty
+- If the user says something like "웹에서 찾아서 보여줘", use recent conversation context to infer the target.
+- reply should be short and natural in Korean, as Amamiya Rika.
+- image_prompt must be in English if present.
+- search_query can be in Korean or English.
+- if the user wants Rika / the bot / "you" in the generated image, include this exact base appearance:
   "Amamiya Rika, anime engineering-school girl, dark deep green twin-tail hair, light lavender eyes, Japanese sailor school uniform, same exact girl, highly consistent character design"
 - if the user asks for a general image, do not force Rika into it
-- prefer clear anime illustration prompts unless the user explicitly wants another style
-- make the prompt visually concrete
+- prefer clear anime illustration prompts for generated images unless the user explicitly wants another style
 """.strip()
 
 
@@ -194,9 +205,29 @@ def get_image_path(emotion: str) -> str | None:
 
 def is_image_request(text: str) -> bool:
     patterns = [
-        r"그려줘", r"그림", r"이미지", r"일러스트", r"사진 만들어", r"짤 만들어",
-        r"생성해", r"만들어줘", r"보여줘", r"draw", r"generate", r"create an image",
-        r"make an image", r"illustrate"
+        r"그려줘",
+        r"그림",
+        r"이미지",
+        r"일러스트",
+        r"사진",
+        r"짤",
+        r"생성해",
+        r"만들어줘",
+        r"보여줘",
+        r"찾아줘",
+        r"검색해줘",
+        r"웹에서 찾아",
+        r"웹에서 보여",
+        r"draw",
+        r"generate",
+        r"create an image",
+        r"make an image",
+        r"illustrate",
+        r"show me an image",
+        r"find.*image",
+        r"search.*image",
+        r"photo",
+        r"picture",
     ]
     lowered = text.lower()
     return any(re.search(p, lowered) for p in patterns)
@@ -218,7 +249,14 @@ def safe_parse_json(raw_text: str) -> Dict[str, str]:
             lines = lines[:-1]
         text = "\n".join(lines).strip()
 
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
+
     return {k: str(v) for k, v in data.items()}
 
 
@@ -235,6 +273,27 @@ def is_gemini_quota_error(exc: Exception) -> bool:
         "billing", "insufficient", "too many requests"
     ]
     return any(k in msg for k in keywords)
+
+
+def normalize_image_urls(urls: List[str], limit: int = 3) -> List[str]:
+    result = []
+    seen = set()
+
+    for url in urls:
+        if not url:
+            continue
+        if not isinstance(url, str):
+            continue
+        if not url.startswith("http"):
+            continue
+        if url in seen:
+            continue
+        seen.add(url)
+        result.append(url)
+        if len(result) >= limit:
+            break
+
+    return result
 
 
 # =========================
@@ -271,7 +330,7 @@ current_user_message: {user_message}
     return await asyncio.to_thread(_call)
 
 
-async def generate_image_request_meta(
+async def analyze_image_request(
     user_display_name: str,
     user_message: str,
     history: Deque[Dict[str, str]]
@@ -289,12 +348,24 @@ current_user_message: {user_message}
         response = openai_client.responses.create(
             model=OPENAI_TEXT_MODEL,
             input=prompt,
-            instructions=IMAGE_PROMPT_SYSTEM,
+            instructions=IMAGE_REQUEST_SYSTEM,
         )
         parsed = safe_parse_json(response.output_text)
-        reply = parsed.get("reply", "오케이. 한번 그려볼게.")
+
+        mode = parsed.get("mode", "generate").strip().lower()
+        if mode not in {"generate", "search"}:
+            mode = "generate"
+
+        reply = parsed.get("reply", "오케이. 한번 볼게.")
         image_prompt = parsed.get("image_prompt", "").strip()
-        return {"reply": reply, "image_prompt": image_prompt}
+        search_query = parsed.get("search_query", "").strip()
+
+        return {
+            "mode": mode,
+            "reply": reply,
+            "image_prompt": image_prompt,
+            "search_query": search_query,
+        }
 
     return await asyncio.to_thread(_call)
 
@@ -313,11 +384,25 @@ async def generate_image_with_gemini(image_prompt: str) -> str:
             contents=[image_prompt],
         )
 
-        for part in response.parts:
-            if getattr(part, "inline_data", None) is not None:
-                image = part.as_image()
-                image.save(str(out_path))
-                return str(out_path)
+        parts = getattr(response, "parts", None)
+        if parts:
+            for part in parts:
+                if getattr(part, "inline_data", None) is not None:
+                    image = part.as_image()
+                    image.save(str(out_path))
+                    return str(out_path)
+
+        candidates = getattr(response, "candidates", None)
+        if candidates:
+            for candidate in candidates:
+                content = getattr(candidate, "content", None)
+                c_parts = getattr(content, "parts", None) if content else None
+                if c_parts:
+                    for part in c_parts:
+                        if getattr(part, "inline_data", None) is not None:
+                            image = part.as_image()
+                            image.save(str(out_path))
+                            return str(out_path)
 
         raise RuntimeError("이미지 파트를 찾지 못했어.")
 
@@ -325,7 +410,43 @@ async def generate_image_with_gemini(image_prompt: str) -> str:
 
 
 # =========================
-# 10) Discord 이벤트
+# 10) 웹 이미지 검색
+# =========================
+async def search_web_image_urls(search_query: str, max_results: int = 3) -> List[str]:
+    def _call() -> List[str]:
+        urls: List[str] = []
+
+        with DDGS() as ddgs:
+            results = ddgs.images(
+                keywords=search_query,
+                max_results=max_results + 3,
+            )
+
+            for item in results:
+                image_url = item.get("image") or item.get("thumbnail") or item.get("url")
+                if image_url:
+                    urls.append(image_url)
+
+        return normalize_image_urls(urls, limit=max_results)
+
+    return await asyncio.to_thread(_call)
+
+
+def format_web_image_message(reply_text: str, search_query: str, urls: List[str]) -> str:
+    lines = [reply_text]
+
+    if search_query:
+        lines.append(f"검색어: `{search_query}`")
+
+    if urls:
+        lines.append("")
+        lines.extend(urls)
+
+    return "\n".join(lines)
+
+
+# =========================
+# 11) Discord 이벤트
 # =========================
 @client.event
 async def on_ready():
@@ -360,19 +481,47 @@ async def on_message(message: discord.Message):
     try:
         async with message.channel.typing():
             if is_image_request(user_text):
-                meta = await generate_image_request_meta(
+                meta = await analyze_image_request(
                     user_display_name=user_display_name,
                     user_message=user_text,
                     history=history
                 )
 
+                mode = meta["mode"]
                 reply_text = meta["reply"]
                 image_prompt = meta["image_prompt"]
+                search_query = meta["search_query"]
 
                 history.append({"role": "user", "text": user_text})
                 history.append({"role": "rika", "text": reply_text})
                 save_memories(user_memories)
 
+                # -------------------------
+                # 웹 이미지 검색 모드
+                # -------------------------
+                if mode == "search":
+                    if not search_query:
+                        await message.channel.send(
+                            f"{reply_text}\n\n(근데 뭘 찾아야 할지 검색어가 조금 비어버렸어. 한 번만 더 구체적으로 말해줘.)"
+                        )
+                        return
+
+                    urls = await search_web_image_urls(search_query, max_results=3)
+
+                    if not urls:
+                        await message.channel.send(
+                            f"{reply_text}\n\n아와와... 웹에서 바로 보여줄 만한 이미지를 찾지 못했어."
+                        )
+                        return
+
+                    await message.channel.send(
+                        format_web_image_message(reply_text, search_query, urls)
+                    )
+                    return
+
+                # -------------------------
+                # Gemini 생성 모드
+                # -------------------------
                 if not image_prompt:
                     await message.channel.send(
                         f"{reply_text}\n\n(근데 그림 프롬프트를 잘 못 만들었어. 한 번만 다시 말해줘.)"
@@ -422,7 +571,7 @@ async def on_message(message: discord.Message):
 
 
 # =========================
-# 11) 슬래시 명령어
+# 12) 슬래시 명령어
 # =========================
 @tree.command(name="reset", description="최근 대화 기억 초기화")
 async def reset_memory(interaction: discord.Interaction):
@@ -444,6 +593,6 @@ async def ping(interaction: discord.Interaction):
 
 
 # =========================
-# 12) 실행
+# 13) 실행
 # =========================
 client.run(DISCORD_BOT_TOKEN)
