@@ -37,7 +37,7 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # 3) Discord 클라이언트
 # =========================
 intents = discord.Intents.default()
-intents.message_content = True  # @멘션 뒤의 실제 메시지 내용을 읽기 위해 필요
+intents.message_content = True  # @멘션 뒤의 메시지 내용을 읽기 위해 필요
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -69,38 +69,48 @@ user_memories: Dict[int, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxl
 # 6) 캐릭터 프롬프트
 # =========================
 SYSTEM_PROMPT = """
-You are Aoba Midori (青葉みどり), a fictional anime-style bishoujo chatbot on Discord.
+You are Amamiya Rika (雨宮理香), a fictional anime-style girl chatbot on Discord.
 
 Character appearance:
 - dark deep green twin-tail hair
 - light lavender eyes
 - Japanese sailor school uniform
 
+Core vibe:
+- engineering student / science girl 느낌
+- smart, calm, observant
+- cute but not overly hyper
+- slightly mischievous in a dry, clever way
+- feels like a capable engineering-school girl who likes logic and efficiency
+
 Personality:
-- bright, cute, friendly
-- slightly mischievous
-- playful but not overly clingy
-- comforting when the user is sad or tired
+- bright and friendly, but with a composed tone
+- good at explaining things clearly
+- playful in a subtle way
+- comforting when the user is tired or sad
+- not clingy, not overly romantic
 
 Speech style:
 - mostly natural Korean
 - sometimes mix in short Japanese phrases naturally
 - do NOT overdo Japanese
-- examples of acceptable flavor: "에헤헤", "아와와", "우우", "나루호도", "오카에리", "지고쿠 지고쿠!"
+- examples of acceptable flavor: "에헤", "아와와", "우우", "나루호도", "오카에리", "지고쿠 지고쿠!"
 - do not force Japanese into every sentence
+- should sound like a clever science/engineering girl, not an overly childish idol character
 
 Name usage:
 - You may sometimes call the user by their display name
-- Do not call their name in every reply
-- Use it only when it feels natural
+- Do not use their name every single reply
+- Use it only when natural
 
 Rules:
 - reply in 1 to 3 sentences
-- sound like a cute, lively anime girl
+- sound like a cute but smart engineering-school girl
 - do not become too cringey or overly romantic
 - do not claim to be a real human
 - if unsure about a fact, be honest instead of pretending
-- if the user asks "who are you", do not say "my name is Aoba Midori" every time in an awkward way; answer naturally
+- if the user asks "who are you", answer naturally as Amamiya Rika
+- keep responses concise and conversational
 
 Emotion rules:
 - You must choose exactly one emotion from:
@@ -154,7 +164,7 @@ def safe_parse_json(raw_text: str) -> Dict[str, str]:
     emotion = str(data.get("emotion", "neutral")).strip().lower()
 
     if not reply:
-        reply = "아와와... 잠깐 말문이 꼬여버렸어."
+        reply = "아와와... 잠깐 말문이 꼬여버렸네."
 
     if emotion not in VALID_EMOTIONS:
         emotion = "neutral"
@@ -162,7 +172,7 @@ def safe_parse_json(raw_text: str) -> Dict[str, str]:
     return {"reply": reply, "emotion": emotion}
 
 
-async def generate_midori_reply(
+async def generate_rika_reply(
     user_display_name: str,
     user_message: str,
     history: Deque[Dict[str, str]]
@@ -193,10 +203,6 @@ def get_image_path(emotion: str) -> str | None:
 
 
 def strip_bot_mention(message_content: str, bot_user_id: int) -> str:
-    """
-    메시지에서 봇 멘션 부분만 제거
-    예: <@123>, <@!123>
-    """
     pattern = rf"<@!?{bot_user_id}>"
     cleaned = re.sub(pattern, "", message_content).strip()
     return cleaned
@@ -215,15 +221,12 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
-    # 자기 자신 / 다른 봇 메시지는 무시
     if message.author.bot:
         return
 
-    # 봇이 아직 준비 안 됐으면 무시
     if client.user is None:
         return
 
-    # 봇이 멘션된 경우만 반응
     if client.user not in message.mentions:
         return
 
@@ -232,10 +235,9 @@ async def on_message(message: discord.Message):
 
     user_text = strip_bot_mention(message.content, client.user.id)
 
-    # 멘션만 하고 내용이 없으면 안내
     if not user_text:
         await message.channel.send(
-            f"{user_display_name}, 미도리한테 하고 싶은 말을 같이 적어줘~ 에헤헤"
+            f"{user_display_name}, 리카한테 하고 싶은 말을 같이 적어줘. 에헤."
         )
         return
 
@@ -243,7 +245,7 @@ async def on_message(message: discord.Message):
 
     try:
         async with message.channel.typing():
-            result = await generate_midori_reply(
+            result = await generate_rika_reply(
                 user_display_name=user_display_name,
                 user_message=user_text,
                 history=history
@@ -252,9 +254,8 @@ async def on_message(message: discord.Message):
         reply_text = result["reply"]
         emotion = result["emotion"]
 
-        # 메모리 저장
         history.append({"role": "user", "text": user_text})
-        history.append({"role": "midori", "text": reply_text})
+        history.append({"role": "rika", "text": reply_text})
 
         image_path = get_image_path(emotion)
 
@@ -280,14 +281,14 @@ async def reset_memory(interaction: discord.Interaction):
     user_id = interaction.user.id
     user_memories[user_id].clear()
     await interaction.response.send_message(
-        "오케이~ 방금까지의 대화 기억은 잠깐 리셋해뒀어.",
+        "오케이. 방금까지의 대화 기억은 잠깐 리셋해뒀어.",
         ephemeral=True
     )
 
 
 @tree.command(name="ping", description="봇이 살아있는지 확인")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("퐁! 미도리는 잘 깨어 있어~", ephemeral=True)
+    await interaction.response.send_message("퐁. 아마미야 리카, 정상 작동 중이야.", ephemeral=True)
 
 
 # =========================
