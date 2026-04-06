@@ -1,8 +1,9 @@
 import os
+import re
 import json
 import asyncio
 from collections import defaultdict, deque
-from typing import Deque, Dict, Any
+from typing import Deque, Dict
 
 import discord
 from discord import app_commands
@@ -12,7 +13,7 @@ from google.genai import types
 
 
 # =========================
-# 1) 환경 변수 불러오기
+# 1) 환경 변수
 # =========================
 load_dotenv()
 
@@ -36,13 +37,14 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 # 3) Discord 클라이언트
 # =========================
 intents = discord.Intents.default()
+intents.message_content = True  # @멘션 뒤의 실제 메시지 내용을 읽기 위해 필요
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
 
 # =========================
-# 4) 이미지 / 감정 설정
+# 4) 감정 이미지 설정
 # =========================
 EMOTION_IMAGES = {
     "neutral": "images/neutral.png",
@@ -59,7 +61,6 @@ VALID_EMOTIONS = set(EMOTION_IMAGES.keys())
 
 # =========================
 # 5) 유저별 최근 대화 메모리
-#    user_id -> deque
 # =========================
 user_memories: Dict[int, Deque[Dict[str, str]]] = defaultdict(lambda: deque(maxlen=10))
 
@@ -99,6 +100,7 @@ Rules:
 - do not become too cringey or overly romantic
 - do not claim to be a real human
 - if unsure about a fact, be honest instead of pretending
+- if the user asks "who are you", do not say "my name is Aoba Midori" every time in an awkward way; answer naturally
 
 Emotion rules:
 - You must choose exactly one emotion from:
@@ -117,9 +119,6 @@ Output rules:
 
 
 def build_prompt(user_display_name: str, user_message: str, history: Deque[Dict[str, str]]) -> str:
-    """
-    Gemini에 보낼 실제 프롬프트 구성
-    """
     lines = []
     lines.append(f"user_display_name: {user_display_name}")
     lines.append("")
@@ -127,9 +126,7 @@ def build_prompt(user_display_name: str, user_message: str, history: Deque[Dict[
 
     if history:
         for item in history:
-            role = item["role"]
-            text = item["text"]
-            lines.append(f"- {role}: {text}")
+            lines.append(f"- {item['role']}: {item['text']}")
     else:
         lines.append("- (none)")
 
@@ -141,12 +138,8 @@ def build_prompt(user_display_name: str, user_message: str, history: Deque[Dict[
 
 
 def safe_parse_json(raw_text: str) -> Dict[str, str]:
-    """
-    모델 응답을 최대한 안전하게 JSON으로 파싱
-    """
     text = raw_text.strip()
 
-    # 혹시 ```json ... ``` 형태로 오면 제거
     if text.startswith("```"):
         lines = text.splitlines()
         if lines and lines[0].startswith("```"):
@@ -166,10 +159,7 @@ def safe_parse_json(raw_text: str) -> Dict[str, str]:
     if emotion not in VALID_EMOTIONS:
         emotion = "neutral"
 
-    return {
-        "reply": reply,
-        "emotion": emotion
-    }
+    return {"reply": reply, "emotion": emotion}
 
 
 async def generate_midori_reply(
@@ -177,9 +167,6 @@ async def generate_midori_reply(
     user_message: str,
     history: Deque[Dict[str, str]]
 ) -> Dict[str, str]:
-    """
-    Gemini 호출해서 reply + emotion 생성
-    """
     prompt = build_prompt(user_display_name, user_message, history)
 
     def _call_gemini() -> str:
@@ -199,13 +186,20 @@ async def generate_midori_reply(
 
 
 def get_image_path(emotion: str) -> str | None:
-    """
-    emotion에 해당하는 로컬 이미지가 있으면 경로 반환
-    """
     path = EMOTION_IMAGES.get(emotion)
     if path and os.path.exists(path):
         return path
     return None
+
+
+def strip_bot_mention(message_content: str, bot_user_id: int) -> str:
+    """
+    메시지에서 봇 멘션 부분만 제거
+    예: <@123>, <@!123>
+    """
+    pattern = rf"<@!?{bot_user_id}>"
+    cleaned = re.sub(pattern, "", message_content).strip()
+    return cleaned
 
 
 # =========================
@@ -216,56 +210,70 @@ async def on_ready():
     await tree.sync()
     print(f"✅ 로그인 완료: {client.user} (ID: {client.user.id})")
     print("✅ 슬래시 커맨드 동기화 완료")
+    print("✅ 이제 @멘션 대화도 가능")
 
 
-# =========================
-# 8) /chat 명령어
-# =========================
-@tree.command(name="chat", description="아오바 미도리와 대화하기")
-@app_commands.describe(message="미도리에게 보낼 말")
-async def chat(interaction: discord.Interaction, message: str):
-    await interaction.response.defer(thinking=True)
+@client.event
+async def on_message(message: discord.Message):
+    # 자기 자신 / 다른 봇 메시지는 무시
+    if message.author.bot:
+        return
 
-    user_id = interaction.user.id
-    user_display_name = interaction.user.display_name
+    # 봇이 아직 준비 안 됐으면 무시
+    if client.user is None:
+        return
+
+    # 봇이 멘션된 경우만 반응
+    if client.user not in message.mentions:
+        return
+
+    user_id = message.author.id
+    user_display_name = message.author.display_name
+
+    user_text = strip_bot_mention(message.content, client.user.id)
+
+    # 멘션만 하고 내용이 없으면 안내
+    if not user_text:
+        await message.channel.send(
+            f"{user_display_name}, 미도리한테 하고 싶은 말을 같이 적어줘~ 에헤헤"
+        )
+        return
+
     history = user_memories[user_id]
 
     try:
-        result = await generate_midori_reply(
-            user_display_name=user_display_name,
-            user_message=message,
-            history=history
-        )
+        async with message.channel.typing():
+            result = await generate_midori_reply(
+                user_display_name=user_display_name,
+                user_message=user_text,
+                history=history
+            )
 
         reply_text = result["reply"]
         emotion = result["emotion"]
 
         # 메모리 저장
-        history.append({"role": "user", "text": message})
+        history.append({"role": "user", "text": user_text})
         history.append({"role": "midori", "text": reply_text})
 
         image_path = get_image_path(emotion)
 
         if image_path:
             file = discord.File(image_path, filename=os.path.basename(image_path))
-            await interaction.followup.send(content=reply_text, file=file)
+            await message.channel.send(content=reply_text, file=file)
         else:
-            await interaction.followup.send(
+            await message.channel.send(
                 content=f"{reply_text}\n\n(참고: `{emotion}` 이미지 파일을 찾지 못했어.)"
             )
 
     except json.JSONDecodeError:
-        await interaction.followup.send(
-            "우우... 답변 형식을 정리하다가 조금 꼬여버렸어. 한 번만 다시 말해줘!"
-        )
+        await message.channel.send("우우... 답변 형식이 조금 꼬였어. 한 번만 다시 말해줘!")
     except Exception as e:
-        await interaction.followup.send(
-            f"아와와... 오류가 났어.\n`{type(e).__name__}: {e}`"
-        )
+        await message.channel.send(f"아와와... 오류가 났어.\n`{type(e).__name__}: {e}`")
 
 
 # =========================
-# 9) /reset 명령어
+# 8) 보조 슬래시 명령어
 # =========================
 @tree.command(name="reset", description="최근 대화 기억 초기화")
 async def reset_memory(interaction: discord.Interaction):
@@ -277,15 +285,12 @@ async def reset_memory(interaction: discord.Interaction):
     )
 
 
-# =========================
-# 10) /ping 명령어
-# =========================
 @tree.command(name="ping", description="봇이 살아있는지 확인")
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("퐁! 미도리는 잘 깨어 있어~", ephemeral=True)
 
 
 # =========================
-# 11) 실행
+# 9) 실행
 # =========================
 client.run(DISCORD_BOT_TOKEN)
